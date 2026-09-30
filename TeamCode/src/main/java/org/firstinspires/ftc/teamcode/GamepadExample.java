@@ -15,6 +15,7 @@ public class GamepadExample extends OpMode {
     @Override
     public void loop() {
         double speedForward = -gamepad1.right_stick_y;
+
         telemetry.addData("right x", gamepad1.right_stick_x);
         telemetry.addData("right y", speedForward);
         telemetry.addData("a", gamepad1.a);
