@@ -4,6 +4,7 @@ import com.qualcomm.hardware.limelightvision.Limelight3A;
 import com.qualcomm.hardware.limelightvision.LLResult;
 import com.qualcomm.hardware.limelightvision.LLResultTypes;
 import com.qualcomm.robotcore.hardware.HardwareMap;
+import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.Pose3D;
 import org.firstinspires.ftc.robotcore.external.navigation.Position;
 
@@ -28,6 +29,7 @@ public class LimelightUtil {
     private double lastHeightMeters = 0;
     private double lastTx = 0;
     private double lastTy = 0;
+    private double lastTagYaw = 0;
     private int lastTrackedTagId = -1;
     private boolean hasValidTarget = false;
 
@@ -142,6 +144,7 @@ public class LimelightUtil {
             // X and Z form horizontal plane, Y is vertical
             lastDistanceMeters = Math.sqrt(pos.x * pos.x + pos.z * pos.z);
             lastHeightMeters = pos.y;
+            lastTagYaw = robotPoseTargetSpace.getOrientation().getYaw(AngleUnit.DEGREES);
 
             botPose = robotPoseTargetSpace.toString();
 
@@ -157,6 +160,18 @@ public class LimelightUtil {
 
     public String getBotPose(){
         return botPose;
+    }
+
+    /**
+     * Get the robot's yaw relative to the AprilTag (from the tag's 3D pose).
+     * Unlike tx, this changes when the robot is angled to the tag's surface even if
+     * the tag is centered in the image. Check on the robot what it reads when facing
+     * the tag squarely (about 0 or about 180) and which way it moves when turning left.
+     *
+     * @return yaw in degrees, from the last update() with a valid target
+     */
+    public double getTagYaw() {
+        return lastTagYaw;
     }
 
     /**
