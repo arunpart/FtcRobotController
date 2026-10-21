@@ -8,6 +8,8 @@ import org.firstinspires.ftc.teamcode.mechanisms.DCMotorsTest;
 import org.firstinspires.ftc.teamcode.mechanisms.LimelightUtil;
 import org.firstinspires.ftc.teamcode.mechanisms.IMUUtil;
 
+import java.util.List;
+
 /**
  * LimelightPractice using official Limelight3A pattern
  *
@@ -19,6 +21,8 @@ import org.firstinspires.ftc.teamcode.mechanisms.IMUUtil;
  * - X Button: Toggle auto-align
  * - A Button: Toggle auto-drive to target distance
  * - B Button: Stop auto modes
+ * - Y Button: Toggle cluster mode (lock onto a whole AprilTag cluster, e.g. a BioBuzz goal)
+ * - D-pad Right: Cycle target cluster (Any -> each cluster in the tag library)
  */
 @TeleOp
 public class LimelightPractice extends OpMode {
@@ -44,6 +48,11 @@ public class LimelightPractice extends OpMode {
     private double lastTxError = Double.NaN;  // NaN = no previous reading, skip damping
     private boolean xButtonPressed = false;
     private boolean aButtonPressed = false;
+    private boolean yButtonPressed = false;
+    private boolean dpadRightPressed = false;
+
+    private List<String> clusterNames;
+    private int targetClusterIndex = -1;  // -1 = any cluster
 
     @Override
     public void init() {
@@ -54,6 +63,8 @@ public class LimelightPractice extends OpMode {
         // Initialize Limelight with official pattern
         limelight = new LimelightUtil(hardwareMap);
         limelight.setTargetTagId(-1);  // Track any visible tag
+        limelight.setClusterMode(true);  // Prefer whole tag clusters when one is visible
+        clusterNames = limelight.getClusterNames();
 
         // Initialize IMU
         imu = new IMUUtil();
@@ -86,6 +97,25 @@ public class LimelightPractice extends OpMode {
             aButtonPressed = true;
         } else if (!gamepad1.a) {
             aButtonPressed = false;
+        }
+
+        if (gamepad1.y && !yButtonPressed) {
+            limelight.setClusterMode(!limelight.isClusterMode());
+            yButtonPressed = true;
+        } else if (!gamepad1.y) {
+            yButtonPressed = false;
+        }
+
+        if (gamepad1.dpad_right && !dpadRightPressed) {
+            // Cycle: Any -> cluster 0 -> cluster 1 -> ... -> Any
+            targetClusterIndex++;
+            if (targetClusterIndex >= clusterNames.size()) {
+                targetClusterIndex = -1;
+            }
+            limelight.setTargetClusterName(targetClusterIndex < 0 ? null : clusterNames.get(targetClusterIndex));
+            dpadRightPressed = true;
+        } else if (!gamepad1.dpad_right) {
+            dpadRightPressed = false;
         }
 
         if (gamepad1.b) {
@@ -185,6 +215,11 @@ public class LimelightPractice extends OpMode {
         telemetry.addData("", "");
 
         if (limelight.hasTarget()) {
+            if (limelight.isTrackingCluster()) {
+                telemetry.addData("Cluster", limelight.getTrackedClusterName());
+                telemetry.addData("Tags Found", "%d%% %s",
+                        limelight.getClusterPercentFound(), limelight.getClusterTagIds());
+            }
             telemetry.addData("Target ID", limelight.getTrackedTagId());
             telemetry.addData("Distance", String.format("%.2f m (%.1f in)",
                     limelight.getDistanceToTargetMeters(),
@@ -200,6 +235,8 @@ public class LimelightPractice extends OpMode {
         telemetry.addData("", "");
         telemetry.addData("Auto-Align", autoAlignMode ? "ON" : "OFF");
         telemetry.addData("Auto-Drive", autoDriveMode ? "ON" : "OFF");
+        telemetry.addData("Cluster Mode", limelight.isClusterMode() ? "ON" : "OFF");
+        telemetry.addData("Target Cluster", targetClusterIndex < 0 ? "Any" : clusterNames.get(targetClusterIndex));
 
         if (autoDriveMode) {
             telemetry.addData("Target Distance", String.format("%.2f m", targetDistanceMeters));
@@ -207,6 +244,7 @@ public class LimelightPractice extends OpMode {
 
         telemetry.addData("", "");
         telemetry.addData("X: Align | A: Drive | B: Stop", "");
+        telemetry.addData("Y: Cluster Mode | D-pad R: Next Cluster", "");
 
         telemetry.update();
     }

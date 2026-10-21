@@ -7,9 +7,15 @@ import com.qualcomm.robotcore.hardware.HardwareMap;
 import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.Pose3D;
 import org.firstinspires.ftc.robotcore.external.navigation.Position;
+import org.firstinspires.ftc.vision.apriltag.AprilTagClusterMetadata;
+import org.firstinspires.ftc.vision.apriltag.AprilTagGameDatabase;
+import org.firstinspires.ftc.vision.apriltag.AprilTagLibrary;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Utility class for Limelight3A AprilTag detection.
@@ -18,11 +24,30 @@ import java.util.Locale;
  * All getter methods return the last cached data.
  *
  * Design pattern based on official Limelight SDK.
+ *
+ * Cluster mode: FTC SDK 12.0 added AprilTag clusters (several tags on one game element,
+ * e.g. the BioBuzz scoring goals, tags 30-45) to the VisionPortal AprilTagProcessor.
+ * The Limelight does its own detection, so the SDK's cluster solver never sees its data.
+ * Instead this class uses the SDK's AprilTagLibrary to know which tags belong to which
+ * cluster, then combines every visible member into one target (averaged tx/ty/distance),
+ * which stays locked on while some of the tags are blocked.
  */
 public class LimelightUtil {
 
+    // tag36h11 IDs run 0-586; used to count cluster members (the SDK keeps that list package-private)
+    private static final int MAX_TAG_ID = 586;
+
     private Limelight3A limelight;
     private int targetTagId = -1;  // -1 = track any visible tag
+
+    // Cluster tracking (mirrors AprilTagClusterDetection from the SDK)
+    private final AprilTagLibrary tagLibrary;
+    private final Map<AprilTagClusterMetadata, Integer> clusterSizes = new HashMap<>();
+    private boolean clusterMode = false;
+    private String targetClusterName = null;  // null = any cluster
+    private AprilTagClusterMetadata lastCluster = null;
+    private int lastClusterPercentFound = 0;
+    private final List<Integer> lastClusterTagIds = new ArrayList<>();
 
     // Cached data from last update() call
     private double lastDistanceMeters = 0;
@@ -43,6 +68,25 @@ public class LimelightUtil {
      * @param hardwareMap HardwareMap from OpMode
      */
     public LimelightUtil(HardwareMap hardwareMap) {
+        this(hardwareMap, AprilTagGameDatabase.getCurrentGameTagLibrary());
+    }
+
+    /**
+     * Constructor with a custom tag library (defines which tags form clusters).
+     *
+     * @param hardwareMap HardwareMap from OpMode
+     * @param tagLibrary  library whose clusters are used in cluster mode
+     */
+    public LimelightUtil(HardwareMap hardwareMap, AprilTagLibrary tagLibrary) {
+        this.tagLibrary = tagLibrary;
+        for (int id = 0; id <= MAX_TAG_ID; id++) {
+            AprilTagClusterMetadata cluster = tagLibrary.lookupCluster(id);
+            if (cluster != null) {
+                Integer count = clusterSizes.get(cluster);
+                clusterSizes.put(cluster, count == null ? 1 : count + 1);
+            }
+        }
+
         try {
             limelight = hardwareMap.get(Limelight3A.class, "limelight");
             limelight.setPollRateHz(100);
@@ -112,8 +156,17 @@ public class LimelightUtil {
 
         // Get list of detected AprilTags (fiducials)
         List<LLResultTypes.FiducialResult> fiducials = result.getFiducialResults();
+        lastCluster = null;
+        lastClusterPercentFound = 0;
+        lastClusterTagIds.clear();
+
         if (fiducials.isEmpty()) {
             hasValidTarget = false;
+            return;
+        }
+
+        // Cluster mode: lock onto a whole tag cluster; falls back to single tags if none is visible
+        if (clusterMode && updateCluster(fiducials)) {
             return;
         }
 
@@ -152,6 +205,156 @@ public class LimelightUtil {
         } else {
             hasValidTarget = false;
         }
+    }
+
+    /**
+     * Group visible fiducials by cluster, pick the best cluster, and cache its combined
+     * pose as the current target.
+     *
+     * @return true if a cluster target was found and cached
+     */
+    private boolean updateCluster(List<LLResultTypes.FiducialResult> fiducials) {
+        Map<AprilTagClusterMetadata, List<LLResultTypes.FiducialResult>> visible = new HashMap<>();
+        for (LLResultTypes.FiducialResult fiducial : fiducials) {
+            AprilTagClusterMetadata cluster = tagLibrary.lookupCluster(fiducial.getFiducialId());
+            if (cluster == null) {
+                continue;
+            }
+            if (targetClusterName != null && !targetClusterName.equals(cluster.name)) {
+                continue;
+            }
+            List<LLResultTypes.FiducialResult> members = visible.get(cluster);
+            if (members == null) {
+                members = new ArrayList<>();
+                visible.put(cluster, members);
+            }
+            members.add(fiducial);
+        }
+
+        // Best cluster = most tags seen, then largest total area (closest)
+        AprilTagClusterMetadata bestCluster = null;
+        List<LLResultTypes.FiducialResult> bestMembers = null;
+        double bestArea = 0;
+        for (Map.Entry<AprilTagClusterMetadata, List<LLResultTypes.FiducialResult>> entry : visible.entrySet()) {
+            double area = 0;
+            for (LLResultTypes.FiducialResult f : entry.getValue()) {
+                area += f.getTargetArea();
+            }
+            int count = entry.getValue().size();
+            if (bestMembers == null || count > bestMembers.size()
+                    || (count == bestMembers.size() && area > bestArea)) {
+                bestCluster = entry.getKey();
+                bestMembers = entry.getValue();
+                bestArea = area;
+            }
+        }
+        if (bestCluster == null) {
+            return false;
+        }
+
+        // Average every visible member. Aim lands on the cluster center when all tags are seen;
+        // with only some visible it is biased toward the visible ones.
+        double sumTx = 0, sumTy = 0, sumDistance = 0, sumHeight = 0, sumYaw = 0;
+        int poseCount = 0;
+        LLResultTypes.FiducialResult closest = bestMembers.get(0);
+        for (LLResultTypes.FiducialResult f : bestMembers) {
+            sumTx += f.getTargetXDegrees();
+            sumTy += f.getTargetYDegrees();
+            lastClusterTagIds.add(f.getFiducialId());
+            if (f.getTargetArea() > closest.getTargetArea()) {
+                closest = f;
+            }
+            Pose3D pose = f.getRobotPoseTargetSpace();
+            if (pose != null) {
+                Position pos = pose.getPosition();
+                sumDistance += Math.sqrt(pos.x * pos.x + pos.z * pos.z);
+                sumHeight += pos.y;
+                sumYaw += pose.getOrientation().getYaw(AngleUnit.DEGREES);
+                poseCount++;
+            }
+        }
+        if (poseCount == 0) {
+            lastClusterTagIds.clear();
+            return false;
+        }
+
+        int n = bestMembers.size();
+        lastTx = sumTx / n;
+        lastTy = sumTy / n;
+        targetArea = bestArea;
+        lastDistanceMeters = sumDistance / poseCount;
+        lastHeightMeters = sumHeight / poseCount;
+        lastTagYaw = sumYaw / poseCount;
+        lastTrackedTagId = closest.getFiducialId();
+        botPose = closest.getRobotPoseTargetSpace() != null ? closest.getRobotPoseTargetSpace().toString() : null;
+
+        lastCluster = bestCluster;
+        Integer size = clusterSizes.get(bestCluster);
+        lastClusterPercentFound = (size == null || size == 0) ? 0 : Math.round(100f * n / size);
+        hasValidTarget = true;
+        return true;
+    }
+
+    /**
+     * Turn cluster mode on/off. When on, update() prefers a tag cluster from the tag
+     * library over a single tag, and falls back to single-tag tracking if no cluster is seen.
+     */
+    public void setClusterMode(boolean enabled) {
+        this.clusterMode = enabled;
+    }
+
+    public boolean isClusterMode() {
+        return clusterMode;
+    }
+
+    /**
+     * Only track the cluster with this name (e.g. "RED SCORING", "BLUE SCORING").
+     *
+     * @param name cluster name from the tag library, or null to track any cluster
+     */
+    public void setTargetClusterName(String name) {
+        this.targetClusterName = name;
+    }
+
+    /**
+     * Names of all clusters in the tag library, e.g. for cycling through targets.
+     */
+    public List<String> getClusterNames() {
+        List<String> names = new ArrayList<>();
+        for (AprilTagClusterMetadata cluster : tagLibrary.getAllClusters()) {
+            names.add(cluster.name);
+        }
+        return names;
+    }
+
+    /**
+     * @return true if the current target is a tag cluster (not a single tag)
+     */
+    public boolean isTrackingCluster() {
+        return hasValidTarget && lastCluster != null;
+    }
+
+    /**
+     * @return name of the tracked cluster, or null if not tracking a cluster
+     */
+    public String getTrackedClusterName() {
+        return isTrackingCluster() ? lastCluster.name : null;
+    }
+
+    /**
+     * Same meaning as AprilTagClusterDetection.percentClusterFound.
+     *
+     * @return percentage (0-100) of the cluster's tags currently visible
+     */
+    public int getClusterPercentFound() {
+        return isTrackingCluster() ? lastClusterPercentFound : 0;
+    }
+
+    /**
+     * @return IDs of the cluster's tags seen in the last update()
+     */
+    public List<Integer> getClusterTagIds() {
+        return new ArrayList<>(lastClusterTagIds);
     }
 
     public double getTargetArea(){
@@ -315,6 +518,10 @@ public class LimelightUtil {
         }
         if (!hasValidTarget) {
             return "Limelight: No target";
+        }
+        if (isTrackingCluster()) {
+            return String.format(Locale.US, "Cluster %s (%d%%) | Distance: %.2fm | Height: %.2fm | tx: %.1f°",
+                    lastCluster.name, lastClusterPercentFound, lastDistanceMeters, lastHeightMeters, lastTx);
         }
         return String.format(Locale.US, "Tag %d | Distance: %.2fm | Height: %.2fm | tx: %.1f°",
                 lastTrackedTagId, lastDistanceMeters, lastHeightMeters, lastTx);
